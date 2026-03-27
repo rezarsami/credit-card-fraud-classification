@@ -1,0 +1,466 @@
+---
+title: "Credit Card Fraud Detection"
+author: "Reza Rahid Sami"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Introduction
+
+Credit card fraud is a major issue in modern financial systems, costing billions of dollars annually. Financial institutions use machine learning models to identify fraudulent transactions in real time.
+
+This project aims to predict whether a credit card transaction is fraudulent using transaction-level data. The dataset contains anonymized features derived from real transactions, along with a binary response variable indicating whether the transaction was fraudulent.
+
+The goal of this project is to evaluate whether machine learning models can accurately classify transactions as fraudulent or non-fraudulent using features such as transaction amount and anonymized principal components.
+
+In this context, classification refers to predicting a binary outcome variable. Logistic regression is a baseline statistical model, while more flexible models such as random forests and boosting can capture complex relationships. Model performance will be evaluated using accuracy and ROC-AUC.
+
+```{r, echo=FALSE}
+knitr::include_graphics("~/Desktop/credit card fraud.png")
+```
+
+
+# Data Source
+
+The dataset used in this project is the “Credit Card Fraud Detection” dataset from Kaggle. It contains anonymized credit card transactions made by European cardholders in September 2013, with the response variable `Class` indicating whether a transaction was fraudulent.
+
+Dataset citation:
+Machine Learning Group – ULB. *Credit Card Fraud Detection*. Kaggle. https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
+
+```{r, results='hide'}
+library(tidyverse)
+library(tidymodels)
+```
+
+```{r}
+data <- read.csv("~/Desktop/creditcard.csv")
+data$Class <- factor(data$Class)
+data <- data %>%
+  rename(fraud = Class)
+```
+The dataset was first loaded into R and stored as a data frame. The response variable, originally labeled “Fraud,” was converted into a factor to ensure it is treated as a categorical variable for classification models. The variable was then renamed to “fraud” for clarity and interpretability in subsequent analysis.
+
+# Codebook
+
+## Codebook
+
+- `Time`: Number of seconds elapsed between this transaction and the first transaction in the dataset.
+- `Amount`: Transaction amount in euros.
+- `Fraud`: Response variable. `1` indicates a fraudulent transaction and `0` indicates a non-fraudulent transaction.
+
+- `V1`: Anonymized numeric predictor created using PCA. 
+- `V2`: Anonymized numeric predictor created using PCA. 
+- `V3`: Anonymized numeric predictor created using PCA. 
+- `V4`: Anonymized numeric predictor created using PCA. 
+...
+- `V28`: Anonymized numeric predictor created using PCA.
+
+The variables V1 through V28 are anonymized features generated using principal component analysis (PCA). These variables represent transformed combinations of the original transaction features and were created to protect sensitive information. As a result, they do not have direct real-world interpretations, but they retain important patterns in the data that can be used for prediction.
+
+# Missing Values
+
+```{r}
+sum(is.na(data))
+```
+
+There are no missing values present in the dataset
+
+# Exploratory Data Analysis
+
+## Class distribution
+
+```{r}
+ggplot(data, aes(x = fraud)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Fraud vs Non-Fraud Transactions")
+```
+The dataset is highly imbalanced, with far fewer fraudulent transactions than non-fraudulent ones. This imbalance is a key challenge in fraud detection.
+
+## Transaction amount distribution
+
+```{r}
+ggplot(data, aes(x = Amount)) +
+  geom_histogram(bins = 50, fill = "darkgreen") +
+  labs(title = "Distribution of Transaction Amount")
+```
+
+The distribution of transaction amounts is highly right-skewed, with the majority of transactions occurring at very low values and a small number of extremely large transactions forming a long right tail. This indicates that most credit card activity consists of small purchases, while large transactions are relatively rare. The presence of outliers suggests that transaction amount varies widely across observations and may require transformation or scaling for modeling.
+
+## Fraud vs amount
+
+```{r}
+ggplot(data, aes(x = fraud, y = Amount)) +
+  geom_boxplot(fill = "orange") +
+  labs(title = "Transaction Amount by Fraud Status")
+```
+
+The boxplot compares transaction amounts between fraudulent and non-fraudulent transactions. Both groups are highly concentrated at lower transaction values, indicating that most transactions are small regardless of fraud status. However, non-fraudulent transactions exhibit significantly larger outliers, suggesting that legitimate transactions are more likely to involve high dollar amounts. In contrast, fraudulent transactions tend to occur within a narrower range of smaller values. Overall, transaction amount alone does not strongly separate fraudulent from non-fraudulent transactions, but it may still contribute useful information when combined with other predictors.
+
+## Correlation (subset)
+
+```{r}
+cor_matrix <- cor(data[, 1:10])
+corrplot::corrplot(cor_matrix, method = "color")
+```
+
+The correlation plot shows that most of the variables exhibit weak pairwise correlations, indicating that the predictors are largely independent. This is expected, as many of the variables are derived from principal component analysis (PCA), which produces uncorrelated features. The lack of strong correlations suggests that multicollinearity is not a major concern and that each variable may contribute unique information to the predictive models.
+
+This structure is beneficial for machine learning models, as it reduces redundancy among predictors and allows models such as logistic regression, random forests, and boosting to learn more efficiently from the data.
+
+These exploratory findings suggest strong class imbalance and substantial variation in transaction amounts, both of which motivate the modeling choices in the next section.
+
+# Data Splitting
+
+```{r}
+set.seed(123)
+
+data_split <- initial_split(data, prop = 0.7, strata = fraud)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+cv_folds <- vfold_cv(train_data, v = 5, strata = fraud)
+```
+The dataset was split into training and testing sets using a 70/30 split. Stratified sampling was used based on the response variable to ensure that both sets maintain the same proportion of fraudulent and non-fraudulent transactions, which is important due to the highly imbalanced nature of the data.
+
+The training data was used to fit the models, while the testing data was reserved for evaluating final model performance. Additionally, 5-fold cross-validation was applied to the training data to assess model performance and tune hyperparameters. Stratification was also used in cross-validation to preserve class balance across folds.
+
+# Recipe
+
+```{r}
+fraud_recipe <- recipe(fraud ~ ., data = train_data) %>%
+  step_normalize(all_predictors())
+```
+
+The modeling process begins by defining a recipe that specifies the relationship between the response variable and the predictors. In this case, the outcome variable is “fraud,” and all remaining variables are used as predictors.
+
+All predictor variables were normalized using standardization, which centers each variable at zero and scales it to have unit variance. This step is important for ensuring that variables measured on different scales do not disproportionately influence the model. In particular, models such as k-nearest neighbors rely on distance calculations and therefore require properly scaled inputs. This preprocessing step improves model performance and stability across different algorithms.
+
+# Models
+
+## Logistic Regression
+
+```{r, echo=FALSE, warning=FALSE}
+log_model <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_workflow <- workflow() %>%
+  add_recipe(fraud_recipe) %>%
+  add_model(log_model)
+
+log_results <- fit_resamples(
+  log_workflow,
+  resamples = cv_folds,
+  metrics = metric_set(accuracy, roc_auc)
+)
+```
+
+Logistic regression was used as a baseline classification model to predict whether a transaction is fraudulent. This model estimates the probability of fraud based on a linear combination of the predictor variables and applies a logistic transformation to produce probabilities between 0 and 1.
+
+The model was implemented using a workflow that combines preprocessing steps with model fitting. It was evaluated using 5-fold cross-validation on the training data, with performance measured using accuracy and ROC-AUC.
+
+As a relatively simple and interpretable model, logistic regression provides a useful benchmark for comparing the performance of more flexible machine learning methods.
+
+## KNN
+
+```{r}
+library(knitr)
+library(dplyr)
+
+set.seed(123)
+
+train_knn <- train_data %>%
+  slice_sample(n = 10000)
+
+cv_knn <- vfold_cv(train_knn, v = 5, strata = fraud)
+
+knn_recipe <- recipe(fraud ~ ., data = train_knn) %>%
+  step_normalize(all_predictors())
+
+knn_model <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_workflow <- workflow() %>%
+  add_recipe(knn_recipe) %>%
+  add_model(knn_model)
+
+knn_grid <- tibble(neighbors = c(3, 5, 7, 9, 11, 15, 21))
+
+knn_tuned <- tune_grid(
+  knn_workflow,
+  resamples = cv_knn,
+  grid = knn_grid,
+  metrics = metric_set(accuracy, roc_auc)
+)
+
+# All tuning results
+collect_metrics(knn_tuned) %>%
+  mutate(mean = round(mean, 4)) %>%
+  kable(caption = "KNN Tuning Results")
+
+# Best result (ROC-AUC)
+show_best(knn_tuned, metric = "roc_auc") %>%
+  mutate(mean = round(mean, 4)) %>%
+  kable(caption = "Best KNN Model Based on ROC-AUC")
+```
+
+Because k-nearest neighbors is computationally expensive on very large datasets, the KNN model was fit on a random subsample of the training data. This allowed the model to be included in the comparison while keeping computation manageable.
+
+The KNN model was tuned over different values of the number of neighbors (k) to determine the optimal level of smoothing. Across all values tested (k = 3, 5, 7, 9, 11, 15, 21), the model achieved extremely high accuracy (above 99.97%) and consistently high ROC-AUC values (approximately 0.989). 
+
+The results show that model performance is relatively stable across different choices of k, indicating that the model is not highly sensitive to this parameter. The best performance was achieved at k = 7, which produced the highest accuracy while maintaining strong ROC-AUC. 
+
+Overall, these results suggest that the KNN model performs very well on this dataset and that moderate values of k provide a good balance between model flexibility and stability.
+
+## Random Forest (Tuned)
+
+```{r}
+set.seed(123)
+
+train_rf <- train_data %>%
+  slice_sample(n = 10000)
+
+cv_rf <- vfold_cv(train_rf, v = 3, strata = fraud)
+
+rf_recipe <- recipe(fraud ~ ., data = train_rf) %>%
+  step_normalize(all_predictors())
+
+rf_model <- rand_forest(mtry = tune(), trees = 100) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_model)
+
+rf_grid <- grid_regular(mtry(range = c(2, 10)), levels = 3)
+
+rf_tuned <- tune_grid(
+  rf_workflow,
+  resamples = cv_rf,
+  grid = rf_grid,
+  metrics = metric_set(accuracy, roc_auc)
+)
+
+# All tuning results
+collect_metrics(rf_tuned) %>%
+  mutate(
+    mean = round(mean, 4),
+    std_err = round(std_err, 4)
+  ) %>%
+  kable(
+    caption = "Random Forest Tuning Metrics",
+    col.names = c("mtry", "Metric", "Estimator", "Mean", "Sample Size", "Std. Error", "Config")
+  )
+
+# Best models by ROC-AUC
+show_best(rf_tuned, metric = "roc_auc") %>%
+  mutate(
+    mean = round(mean, 4),
+    std_err = round(std_err, 4)
+  ) %>%
+  kable(
+    caption = "Best Random Forest Models by ROC-AUC",
+    col.names = c("mtry", "Metric", "Estimator", "Mean", "Sample Size", "Std. Error", "Config")
+  )
+
+#best model
+best_rf <- select_best(rf_tuned, metric = "roc_auc")
+
+best_rf %>%
+  kable(
+    caption = "Selected Best Random Forest Model"
+  )
+```
+
+The random forest model was tuned over different values of the mtry parameter, which controls the number of predictors randomly selected at each split. The results show that model performance improved as mtry increased, with both accuracy and ROC-AUC reaching their highest values at mtry = 10.
+
+Specifically, the ROC-AUC increased from approximately 0.99989 at mtry = 2 to 0.99998 at mtry = 10, indicating that using more predictors at each split allowed the model to better capture complex relationships in the data. This suggests that the additional information provided by a larger subset of features improves the model’s ability to distinguish between fraudulent and non-fraudulent transactions.
+
+Overall, the random forest model demonstrated extremely strong and stable performance across all values of mtry, with mtry = 10 selected as the optimal parameter. These results highlight the effectiveness of ensemble methods in capturing nonlinear patterns in high-dimensional datasets.
+
+## Boosting
+
+```{r}
+## Boosting (Tuned)
+library(knitr)
+library(dplyr)
+
+set.seed(123)
+
+train_boost <- train_data %>%
+  slice_sample(n = 10000)
+
+cv_boost <- vfold_cv(train_boost, v = 5, strata = fraud)
+
+boost_recipe <- recipe(fraud ~ ., data = train_boost) %>%
+  step_normalize(all_predictors())
+
+boost_model <- boost_tree(
+  trees = 100,
+  learn_rate = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+boost_workflow <- workflow() %>%
+  add_recipe(boost_recipe) %>%
+  add_model(boost_model)
+
+boost_grid <- tibble(learn_rate = c(0.001, 0.01, 0.05, 0.1, 0.3))
+
+boost_tuned <- tune_grid(
+  boost_workflow,
+  resamples = cv_boost,
+  grid = boost_grid,
+  metrics = metric_set(accuracy, roc_auc)
+)
+
+# Clean table for report
+boost_results_table <- collect_metrics(boost_tuned) %>%
+  filter(.metric %in% c("accuracy", "roc_auc")) %>%
+  select(learn_rate, .metric, mean, std_err) %>%
+  mutate(
+    mean = round(mean, 4),
+    std_err = round(std_err, 4)
+  )
+
+boost_results_table %>%
+  kable(
+    col.names = c("Learning Rate", "Metric", "Mean", "Std. Error"),
+    caption = "Boosting Model Tuning Results"
+  )
+```
+The boosting model was tuned over different values of the learning rate to determine the optimal level of model update at each iteration. The results show that larger learning rates produced the strongest performance, with a learning rate of 0.3 achieving the highest ROC-AUC of approximately 0.9999.
+
+As the learning rate decreased, model performance declined, particularly at very small values such as 0.001, where the ROC-AUC dropped to approximately 0.938. This suggests that extremely small learning rates may lead to underfitting, as the model updates too slowly to capture patterns in the data.
+
+Overall, the results indicate that higher learning rates are more effective for this dataset, likely due to the strong signal present in the features. A learning rate of 0.3 was selected as the optimal value for the final boosting model.
+
+After comparing cross-validated performance across candidate models, the strongest model was selected for final evaluation on the held-out test set.
+
+# Model Comparison
+
+```{r}
+library(knitr)
+library(dplyr)
+library(tidyr)
+
+log_metrics <- collect_metrics(log_results) %>%
+  filter(.metric %in% c("accuracy", "roc_auc")) %>%
+  select(.metric, mean) %>%
+  mutate(model = "Logistic")
+
+knn_metrics <- show_best(knn_tuned, metric = "roc_auc", n = 1) %>%
+  select(.metric, mean) %>%
+  bind_rows(
+    show_best(knn_tuned, metric = "accuracy", n = 1) %>%
+      select(.metric, mean)
+  ) %>%
+  mutate(model = "KNN")
+
+rf_metrics <- show_best(rf_tuned, metric = "roc_auc", n = 1) %>%
+  select(.metric, mean) %>%
+  bind_rows(
+    show_best(rf_tuned, metric = "accuracy", n = 1) %>%
+      select(.metric, mean)
+  ) %>%
+  mutate(model = "Random Forest")
+
+boost_metrics <- show_best(boost_tuned, metric = "roc_auc", n = 1) %>%
+  select(.metric, mean) %>%
+  bind_rows(
+    show_best(boost_tuned, metric = "accuracy", n = 1) %>%
+      select(.metric, mean)
+  ) %>%
+  mutate(model = "Boosting")
+
+model_comparison <- bind_rows(
+  log_metrics,
+  knn_metrics,
+  rf_metrics,
+  boost_metrics
+) %>%
+  distinct(model, .metric, .keep_all = TRUE) %>%
+  mutate(mean = round(mean, 4)) %>%
+  pivot_wider(names_from = .metric, values_from = mean)
+
+model_comparison %>%
+  kable(
+    col.names = c("Model", "Accuracy", "ROC-AUC"),
+    caption = "Cross-Validation Performance of Classification Models"
+  )
+```
+
+The cross-validation results show extremely high accuracy across all models, with values above 99.9%. However, this metric is misleading due to the highly imbalanced nature of the dataset, where fraudulent transactions represent a very small fraction of all observations. As a result, even simple models can achieve high accuracy by predominantly predicting the majority class.
+
+For this reason, ROC-AUC provides a more meaningful measure of performance. The results show that all models perform well in distinguishing between fraudulent and non-fraudulent transactions, with ROC-AUC values above 0.97. Among the models, the random forest achieved the best performance with a ROC-AUC of 1.0000, followed closely by boosting at 0.9999. KNN also performed strongly with a ROC-AUC of 0.9889, while logistic regression served as a solid baseline with a ROC-AUC of 0.9747.
+
+Overall, ensemble methods such as random forests and boosting demonstrated superior performance, likely due to their ability to capture complex nonlinear relationships in the data. These results suggest that machine learning models are highly effective for fraud detection when applied to well-structured features.
+
+# Final Model
+
+```{r}
+library(knitr)
+library(dplyr)
+
+best_rf <- select_best(rf_tuned, metric = "roc_auc")
+
+final_rf_workflow <- finalize_workflow(rf_workflow, best_rf)
+
+final_rf_fit <- fit(final_rf_workflow, data = train_data)
+
+rf_class <- predict(final_rf_fit, test_data)
+rf_prob  <- predict(final_rf_fit, test_data, type = "prob")
+
+results <- bind_cols(test_data, rf_class, rf_prob)
+
+# Confusion matrix
+rf_conf_mat <- conf_mat(results, truth = fraud, estimate = .pred_class)
+rf_conf_mat
+
+# Accuracy table
+rf_accuracy <- accuracy(results, truth = fraud, estimate = .pred_class) %>%
+  mutate(.estimate = round(.estimate, 4)) %>%
+  select(.metric, .estimate)
+
+rf_accuracy %>%
+  kable(
+    col.names = c("Metric", "Estimate"),
+    caption = "Test Set Accuracy for the Final Random Forest Model"
+  )
+
+# ROC-AUC table
+rf_a <- roc_auc(results, truth = fraud, .pred_0) %>%
+  mutate(.estimate = round(.estimate, 4)) %>%
+  select(.metric, .estimate)
+rf_a %>%
+  kable(
+    col.names = c("Metric", "Estimate"),
+    caption = "Test Set ROC-AUC for the Final Random Forest Model"
+  )
+```
+
+The final random forest model was evaluated on the test dataset using a confusion matrix, accuracy, and ROC-AUC. The confusion matrix shows that the model correctly classified 85,290 non-fraudulent transactions and 115 fraudulent transactions, with only 36 false positives and 2 false negatives. This indicates that the model is highly effective at identifying both classes, especially fraudulent transactions.
+
+The model achieved an accuracy of 99.96%. However, this metric must be interpreted with caution due to the highly imbalanced nature of the dataset, where non-fraudulent transactions make up the vast majority of observations. In such cases, accuracy alone can be misleading.
+
+The ROC-AUC of 0.937 provides a more reliable measure of performance and indicates that the model has a strong ability to distinguish between fraudulent and non-fraudulent transactions. This high ROC-AUC confirms that the model performs well beyond simple baseline predictions.
+
+Overall, the tuned random forest model demonstrates excellent performance on the fraud detection task, achieving both high accuracy and strong discriminatory power. These results highlight the effectiveness of ensemble methods for identifying complex patterns in highly imbalanced datasets.
+
+# Conclusion
+
+This project investigated whether machine learning models can accurately detect fraudulent credit card transactions using transaction-level data. Several classification methods were evaluated, including logistic regression, k-nearest neighbors (KNN), random forests, and boosting. Each model was trained and assessed using cross-validation, with hyperparameter tuning applied to improve performance.
+
+Across all models, accuracy was extremely high due to the severe class imbalance in the dataset. However, ROC-AUC provided a more meaningful measure of performance. The results showed that all models were effective at distinguishing between fraudulent and non-fraudulent transactions, with ensemble methods performing best. In particular, the random forest model achieved the highest performance, followed closely by boosting, indicating that models capable of capturing nonlinear relationships are especially well-suited for this task.
+
+The final tuned random forest model demonstrated excellent performance on the test data, achieving an accuracy of 99.96% and a ROC-AUC of 0.937. The confusion matrix further showed that the model made very few classification errors, particularly in detecting fraudulent transactions, which is critical in real-world applications. These results highlight the strength of ensemble learning methods in handling complex, high-dimensional datasets.
+
+Despite these strong results, fraud detection remains a challenging problem due to the extreme class imbalance. Future work could focus on techniques such as resampling methods, cost-sensitive learning, or anomaly detection approaches to further improve performance. Additionally, incorporating more interpretable features or temporal patterns could enhance the practical applicability of these models.
+
+Overall, this project demonstrates that machine learning models—particularly ensemble methods—are highly effective tools for detecting fraudulent transactions and can provide valuable support for financial institutions in identifying suspicious activity.
